@@ -69,16 +69,33 @@ const Visualizer = ( function () {
         this.rowImage = null;
         this._resize();
         const self = this;
-        window.addEventListener( 'resize', function () {
-            self._resize();
-        } );
+        /* Track the canvas's displayed size directly: fires on window
+           resizes AND when the panel goes from hidden (0 px) to visible,
+           so the backing store never stays stretched at a stale size. */
+        if ( typeof ResizeObserver !== 'undefined' ) {
+            this.observer = new ResizeObserver( function () {
+                self._resize();
+            } );
+            this.observer.observe( this.canvas );
+        } else {
+            window.addEventListener( 'resize', function () {
+                self._resize();
+            } );
+        }
     }
 
     Visualizer.prototype._resize = function () {
         const dpr = Math.min( window.devicePixelRatio || 1, 2 );
         this.dpr = dpr;
-        const cssWidth = this.canvas.clientWidth || this.canvas.parentElement.clientWidth || 320;
+        const cssWidth = this.canvas.clientWidth;
         const cssHeight = this.canvas.clientHeight || 160;
+        if ( !cssWidth ) {
+            return;    /* hidden; ResizeObserver will call again when shown */
+        }
+        if ( this.canvas.width === Math.floor( cssWidth * dpr ) &&
+            this.canvas.height === Math.floor( cssHeight * dpr ) ) {
+            return;
+        }
         this.canvas.width = Math.floor( cssWidth * dpr );
         this.canvas.height = Math.floor( cssHeight * dpr );
         this.axisH = Math.floor( AXIS_CSS_PX * dpr );
