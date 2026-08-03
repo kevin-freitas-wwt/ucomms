@@ -181,6 +181,10 @@ const Visualizer = ( function () {
     };
 
     Visualizer.prototype._frame = function () {
+        /* Fallback for environments where ResizeObserver doesn't fire:
+           re-check the displayed size on every tick (no-op when synced). */
+        this._resize();
+
         const g = this.g;
         const w = this.canvas.width;
         const waterfallH = this.canvas.height - this.axisH;

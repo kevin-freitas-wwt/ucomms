@@ -3,7 +3,7 @@
  * Bump CACHE version when assets change.
  */
 
-const CACHE = 'ucomms-v4';
+const CACHE = 'ucomms-v5';
 
 const ASSETS = [
     './',
