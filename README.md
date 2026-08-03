@@ -39,7 +39,8 @@ Optional scrolling spectrogram of the active band showing both transmitted and r
 
 - 19 sine tones per band, 120 Hz apart: START, GAP, 16 data nibbles, END.
 - Each byte = 2 nibbles; each nibble tone (90 ms) is followed by a GAP tone (60 ms) so repeated symbols stay unambiguous.
-- Frame: `[encFlag | length] [payload ≤ 127 bytes] [XOR checksum]` → ~3 chars/sec.
+- Data frame: `[type] [encFlag | length] [msgId] [payload ≤ 127 bytes] [XOR checksum]` → ~3 chars/sec.
+- Ack frame: `[type] [msgId] [deviceId] [checksum]` — a receiver that decodes a data frame replies after a random 0.3–2.5 s delay (collision avoidance). The sender listens for ~6 s and counts unique device ids, showing "received by N"; zero acks offers a **Resend** button. Acks are always plaintext.
 - Receiver: FFT peak detection (2048-point) with parabolic interpolation, debounced tone state machine, echo-cancellation/noise-suppression disabled to preserve high frequencies.
 
 ## Offline

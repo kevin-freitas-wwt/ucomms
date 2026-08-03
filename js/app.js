@@ -1,12 +1,17 @@
 /*
  * Ucomms app — UI glue: chat log, settings, send/receive orchestration,
- * offline (service worker) registration.
+ * delivery acknowledgements, offline (service worker) registration.
  */
 
 ( function () {
 
     const STORAGE_MESSAGES = 'ucomms.messages';
     const STORAGE_SETTINGS = 'ucomms.settings';
+    const STORAGE_DEVICE = 'ucomms.deviceId';
+
+    /* How long the sender listens for acks after a transmission: max ack
+       delay (2.5 s) + ack transmission (~2.1 s) + margin. */
+    const ACK_WINDOW_MS = 6000;
 
     const el = {
         statusDot: document.getElementById( 'statusDot' ),
@@ -26,6 +31,8 @@
         vizBandLabel: document.getElementById( 'vizBandLabel' ),
         vizPeakLabel: document.getElementById( 'vizPeakLabel' ),
         listenBtn: document.getElementById( 'listenBtn' ),
+        composer: document.getElementById( 'composer' ),
+        sendProgress: document.getElementById( 'sendProgress' ),
         msgInput: document.getElementById( 'msgInput' ),
         sendBtn: document.getElementById( 'sendBtn' ),
         toast: document.getElementById( 'toast' )
@@ -37,6 +44,14 @@
     let sending = false;
     let listening = false;
     let toastTimer = null;
+    let pendingAck = null;    /* { msgId, localId, deviceIds: Set } while awaiting acks */
+
+    /* Stable random per-device id (1–255) so receivers can be counted. */
+    let deviceId = parseInt( localStorage.getItem( STORAGE_DEVICE ) || '0', 10 );
+    if ( !deviceId || deviceId < 1 || deviceId > 255 ) {
+        deviceId = 1 + Math.floor( Math.random() * 255 );
+        localStorage.setItem( STORAGE_DEVICE, String( deviceId ) );
+    }
 
     const viz = new Visualizer( el.vizCanvas, el.vizBandLabel, el.vizPeakLabel );
 
@@ -73,7 +88,14 @@
 
     function loadMessages() {
         try {
-            return JSON.parse( localStorage.getItem( STORAGE_MESSAGES ) || '[]' );
+            const saved = JSON.parse( localStorage.getItem( STORAGE_MESSAGES ) || '[]' );
+            /* A reload mid-send can leave a message stuck in 'sending'. */
+            saved.forEach( function ( msg ) {
+                if ( msg.status === 'sending' ) {
+                    msg.status = 'unknown';
+                }
+            } );
+            return saved;
         } catch ( e ) {
             return [];
         }
@@ -133,6 +155,33 @@
                 ( msg.encrypted ? ' · 🔒' : '' );
             div.appendChild( meta );
         }
+        if ( msg.dir === 'out' && msg.status ) {
+            const delivery = document.createElement( 'span' );
+            delivery.className = 'delivery';
+            if ( msg.status === 'sending' ) {
+                delivery.textContent = 'sending…';
+            } else if ( msg.status === 'delivered' ) {
+                delivery.classList.add( 'ok' );
+                const n = ( msg.acks || [] ).length;
+                delivery.textContent = '✓ received by ' + n + ( n === 1 ? ' device' : ' devices' );
+            } else if ( msg.status === 'failed' ) {
+                delivery.classList.add( 'none' );
+                delivery.textContent = 'not received by anyone';
+            } else {
+                delivery.classList.add( 'none' );
+                delivery.textContent = 'delivery unconfirmed';
+            }
+            div.appendChild( delivery );
+            if ( msg.status === 'failed' || msg.status === 'unknown' ) {
+                const btn = document.createElement( 'button' );
+                btn.className = 'resend-btn';
+                btn.textContent = 'Resend';
+                btn.addEventListener( 'click', function () {
+                    resendMessage( msg.id );
+                } );
+                div.appendChild( btn );
+            }
+        }
         return div;
     }
 
@@ -140,6 +189,23 @@
         messages.push( msg );
         saveMessages();
         renderMessages();
+    }
+
+    function startProgress( durMs ) {
+        const bar = el.sendProgress;
+        bar.style.transition = 'none';
+        bar.style.width = '0';
+        void bar.offsetWidth;    /* flush so the new transition animates from 0 */
+        bar.style.transition = 'width ' + durMs + 'ms linear';
+        bar.style.width = '100%';
+    }
+
+    function endProgress() {
+        const bar = el.sendProgress;
+        setTimeout( function () {
+            bar.style.transition = 'none';
+            bar.style.width = '0';
+        }, 250 );
     }
 
     /* ------------------------------------------------------------------ */
@@ -170,6 +236,14 @@
         return settings.encCode;
     }
 
+    function makeTxAnalyser( ctx ) {
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0;
+        viz.setTxAnalyser( analyser, ctx.sampleRate );
+        return analyser;
+    }
+
     async function sendMessage() {
         const text = el.msgInput.value.trim();
         if ( !text || sending ) {
@@ -182,55 +256,137 @@
             el.codeInput.focus();
             return;
         }
+        const msg = {
+            id: Date.now().toString( 36 ) + Math.random().toString( 36 ).slice( 2, 7 ),
+            dir: 'out',
+            text: text,
+            time: Date.now(),
+            mode: settings.mode,
+            encrypted: !!encCode,
+            status: 'sending',
+            acks: []
+        };
+        await transmit( msg, encCode, true );
+    }
 
+    async function resendMessage( localId ) {
+        if ( sending ) {
+            return;
+        }
+        const msg = messages.find( function ( m ) {
+            return m.id === localId;
+        } );
+        if ( !msg ) {
+            return;
+        }
+        const encCode = activeEncCode();
+        if ( encCode === undefined ) {
+            toast( 'Set a valid 6-digit code (0–5) or turn encryption off' );
+            return;
+        }
+        msg.mode = settings.mode;
+        msg.encrypted = !!encCode;
+        msg.time = Date.now();
+        await transmit( msg, encCode, false );
+    }
+
+    /*
+     * Transmits a message frame, then listens for acknowledgements for
+     * ACK_WINDOW_MS to learn how many devices received it.
+     */
+    async function transmit( msg, encCode, isNew ) {
+        const msgId = Math.floor( Math.random() * 256 );
         let frame;
         try {
-            frame = Codec.buildFrame( text, encCode );
+            frame = Codec.buildFrame( msg.text, encCode, msgId );
         } catch ( e ) {
             toast( e.message );
             return;
         }
 
+        if ( isNew ) {
+            messages.push( msg );
+            el.msgInput.value = '';
+        }
+        msg.status = 'sending';
+        msg.acks = [];
+        saveMessages();
+        renderMessages();
+
         const ctx = getAudioCtx();
-        const profile = currentProfile();
         sending = true;
         el.sendBtn.disabled = true;
+        el.composer.classList.add( 'sending' );
         setStatus( 'sending' );
         receiver.muted = true;    /* don't decode our own transmission */
+        startProgress( Codec.estimateDurationMs( msg.text ) );
 
-        const txAnalyser = ctx.createAnalyser();
-        txAnalyser.fftSize = 2048;
-        txAnalyser.smoothingTimeConstant = 0;
-        viz.setTxAnalyser( txAnalyser, ctx.sampleRate );
-
+        let sendFailed = false;
         try {
-            await Codec.send( ctx, profile, frame, txAnalyser );
-            addMessage( {
-                dir: 'out',
-                text: text,
-                time: Date.now(),
-                mode: profile.id,
-                encrypted: !!encCode
-            } );
-            el.msgInput.value = '';
+            await Codec.send( ctx, currentProfile(), frame, makeTxAnalyser( ctx ) );
         } catch ( e ) {
             toast( 'Send failed: ' + e.message );
+            sendFailed = true;
         } finally {
             viz.setTxAnalyser( null );
+            endProgress();
             sending = false;
             el.sendBtn.disabled = false;
+            el.composer.classList.remove( 'sending' );
             setTimeout( function () {
                 receiver.muted = false;
             }, 300 );
             setStatus( listening ? 'listening' : 'idle' );
         }
+
+        if ( sendFailed ) {
+            msg.status = 'unknown';
+            saveMessages();
+            renderMessages();
+            return;
+        }
+        await collectAcks( msg, msgId );
+    }
+
+    async function collectAcks( msg, msgId ) {
+        let tempListen = false;
+        if ( !listening ) {
+            try {
+                receiver.profile = currentProfile();
+                receiver.encCode = activeEncCode() || null;
+                await receiver.start( getAudioCtx() );
+                viz.setRxAnalyser( receiver.analyser, getAudioCtx().sampleRate );
+                tempListen = true;
+            } catch ( e ) {
+                /* No mic — can't hear acks, delivery stays unknown. */
+                msg.status = 'unknown';
+                saveMessages();
+                renderMessages();
+                return;
+            }
+        }
+
+        pendingAck = { msgId: msgId, localId: msg.id, deviceIds: new Set() };
+        await new Promise( function ( resolve ) {
+            setTimeout( resolve, ACK_WINDOW_MS );
+        } );
+        const count = pendingAck ? pendingAck.deviceIds.size : ( msg.acks || [] ).length;
+        pendingAck = null;
+
+        if ( tempListen && !listening ) {
+            receiver.stop();
+            viz.setRxAnalyser( null );
+        }
+        msg.status = count > 0 ? 'delivered' : 'failed';
+        saveMessages();
+        renderMessages();
     }
 
     async function toggleListening() {
         if ( listening ) {
+            listening = false;
             receiver.stop();
             viz.setRxAnalyser( null );
-            listening = false;
             el.listenBtn.classList.remove( 'active' );
             el.listenBtn.setAttribute( 'aria-pressed', 'false' );
             setStatus( 'idle' );
@@ -240,7 +396,9 @@
             const ctx = getAudioCtx();
             receiver.profile = currentProfile();
             receiver.encCode = activeEncCode() || null;
-            await receiver.start( ctx );
+            if ( !receiver.running ) {
+                await receiver.start( ctx );
+            }
             viz.setRxAnalyser( receiver.analyser, ctx.sampleRate );
             listening = true;
             el.listenBtn.classList.add( 'active' );
@@ -253,8 +411,15 @@
     }
 
     function onFrameReceived( result ) {
+        if ( result.kind === 'ack' ) {
+            if ( result.ok ) {
+                handleAck( result );
+            }
+            return;    /* acks never appear in the chat log */
+        }
         if ( result.ok ) {
             addMessage( {
+                id: Date.now().toString( 36 ) + Math.random().toString( 36 ).slice( 2, 7 ),
                 dir: 'in',
                 text: result.text,
                 time: Date.now(),
@@ -264,6 +429,7 @@
             if ( navigator.vibrate ) {
                 navigator.vibrate( 80 );
             }
+            scheduleAckReply( result.msgId );
         } else {
             addMessage( {
                 dir: 'error',
@@ -272,6 +438,47 @@
                 mode: settings.mode
             } );
         }
+    }
+
+    function handleAck( result ) {
+        if ( !pendingAck || result.msgId !== pendingAck.msgId ) {
+            return;
+        }
+        pendingAck.deviceIds.add( result.deviceId );
+        const msg = messages.find( function ( m ) {
+            return m.id === pendingAck.localId;
+        } );
+        if ( msg ) {
+            msg.acks = Array.from( pendingAck.deviceIds );
+            msg.status = 'delivered';
+            saveMessages();
+            renderMessages();
+        }
+    }
+
+    /*
+     * Replies to a received data frame with an ack after a random delay
+     * (0.3–2.5 s) so several receivers don't all ack at the same instant.
+     */
+    function scheduleAckReply( msgId ) {
+        const delay = 300 + Math.random() * 2200;
+        setTimeout( async function () {
+            if ( sending ) {
+                return;    /* mid-transmission; skip rather than collide */
+            }
+            const ctx = getAudioCtx();
+            receiver.muted = true;
+            try {
+                await Codec.send( ctx, currentProfile(), Codec.buildAckFrame( msgId, deviceId ), makeTxAnalyser( ctx ) );
+            } catch ( e ) {
+                /* ack is best-effort */
+            } finally {
+                viz.setTxAnalyser( null );
+                setTimeout( function () {
+                    receiver.muted = false;
+                }, 300 );
+            }
+        }, delay );
     }
 
     /* ------------------------------------------------------------------ */

@@ -7,9 +7,14 @@
  *   id 2..17    data nibbles 0x0..0xF
  *   id 18       END marker
  *
- * Frame: [ header byte: encFlag<<7 | length ] [ payload bytes ] [ checksum ]
- * Checksum is XOR of all plaintext payload bytes, so a wrong decryption
- * code is caught the same way a transmission error is.
+ * Frames (first byte is the frame type):
+ *   data  [ TYPE_DATA ] [ encFlag<<7 | length ] [ msgId ] [ payload ] [ checksum ]
+ *   ack   [ TYPE_ACK ] [ msgId ] [ deviceId ] [ checksum ]
+ * The data checksum is msgId XOR all plaintext payload bytes, so a wrong
+ * decryption code is caught the same way a transmission error is. Acks
+ * are always plaintext: a receiver that successfully decodes a data frame
+ * replies with an ack naming the message and its own device id, letting
+ * the sender count how many devices received the message.
  *
  * Each data nibble is transmitted as its tone followed by a GAP tone,
  * which makes repeated identical nibbles unambiguous for the receiver.
@@ -26,6 +31,9 @@ const Codec = ( function () {
     const FFT_SIZE = 2048;
     const POLL_MS = 15;
     const MAX_PAYLOAD = 127;    /* length field is 7 bits */
+
+    const TYPE_DATA = 0x01;
+    const TYPE_ACK = 0x02;
 
     const TONE_START = 0;
     const TONE_GAP = 1;
@@ -72,40 +80,61 @@ const Codec = ( function () {
     /* Framing                                                            */
     /* ------------------------------------------------------------------ */
 
-    function buildFrame( text, encCode ) {
+    function buildFrame( text, encCode, msgId ) {
         const plain = new TextEncoder().encode( text );
         if ( plain.length === 0 || plain.length > MAX_PAYLOAD ) {
             throw new Error( 'Message must be 1–' + MAX_PAYLOAD + ' bytes (yours: ' + plain.length + ')' );
         }
-        let checksum = 0;
+        let checksum = msgId & 0xff;
         for ( let i = 0; i < plain.length; i++ ) {
             checksum ^= plain[ i ];
         }
         const payload = encCode ? Cipher.encrypt( plain, encCode ) : plain;
-        const frame = new Uint8Array( plain.length + 2 );
-        frame[ 0 ] = ( encCode ? 0x80 : 0 ) | plain.length;
-        frame.set( payload, 1 );
+        const frame = new Uint8Array( plain.length + 4 );
+        frame[ 0 ] = TYPE_DATA;
+        frame[ 1 ] = ( encCode ? 0x80 : 0 ) | plain.length;
+        frame[ 2 ] = msgId & 0xff;
+        frame.set( payload, 3 );
         frame[ frame.length - 1 ] = checksum;
         return frame;
     }
 
+    function buildAckFrame( msgId, deviceId ) {
+        return new Uint8Array( [
+            TYPE_ACK,
+            msgId & 0xff,
+            deviceId & 0xff,
+            ( msgId ^ deviceId ^ 0x5a ) & 0xff
+        ] );
+    }
+
     function parseFrame( bytes, encCode ) {
-        if ( bytes.length < 3 ) {
+        if ( bytes.length < 4 ) {
             return { ok: false, reason: 'Frame too short' };
         }
-        const encrypted = ( bytes[ 0 ] & 0x80 ) !== 0;
-        const length = bytes[ 0 ] & 0x7f;
-        if ( bytes.length !== length + 2 ) {
-            return { ok: false, reason: 'Length mismatch (lost symbols)' };
+        if ( bytes[ 0 ] === TYPE_ACK ) {
+            if ( bytes.length !== 4 || bytes[ 3 ] !== ( ( bytes[ 1 ] ^ bytes[ 2 ] ^ 0x5a ) & 0xff ) ) {
+                return { ok: false, reason: 'Corrupt ack frame', kind: 'ack' };
+            }
+            return { ok: true, kind: 'ack', msgId: bytes[ 1 ], deviceId: bytes[ 2 ] };
         }
-        let payload = bytes.slice( 1, 1 + length );
+        if ( bytes[ 0 ] !== TYPE_DATA ) {
+            return { ok: false, reason: 'Unknown frame type' };
+        }
+        const encrypted = ( bytes[ 1 ] & 0x80 ) !== 0;
+        const length = bytes[ 1 ] & 0x7f;
+        const msgId = bytes[ 2 ];
+        if ( bytes.length !== length + 4 ) {
+            return { ok: false, reason: 'Length mismatch (lost symbols)', kind: 'data' };
+        }
+        let payload = bytes.slice( 3, 3 + length );
         if ( encrypted ) {
             if ( !encCode ) {
-                return { ok: false, reason: 'Encrypted message received — set the shared code', encrypted: true };
+                return { ok: false, reason: 'Encrypted message received — set the shared code', kind: 'data', encrypted: true };
             }
             payload = Cipher.decrypt( payload, encCode );
         }
-        let checksum = 0;
+        let checksum = msgId;
         for ( let i = 0; i < payload.length; i++ ) {
             checksum ^= payload[ i ];
         }
@@ -113,6 +142,7 @@ const Codec = ( function () {
             return {
                 ok: false,
                 reason: encrypted ? 'Checksum failed — wrong code or noisy audio' : 'Checksum failed — noisy audio',
+                kind: 'data',
                 encrypted: encrypted
             };
         }
@@ -120,9 +150,9 @@ const Codec = ( function () {
         try {
             text = new TextDecoder( 'utf-8', { fatal: true } ).decode( payload );
         } catch ( e ) {
-            return { ok: false, reason: 'Corrupt text payload', encrypted: encrypted };
+            return { ok: false, reason: 'Corrupt text payload', kind: 'data', encrypted: encrypted };
         }
-        return { ok: true, text: text, encrypted: encrypted };
+        return { ok: true, kind: 'data', text: text, msgId: msgId, encrypted: encrypted };
     }
 
     /* ------------------------------------------------------------------ */
@@ -189,8 +219,12 @@ const Codec = ( function () {
     }
 
     function estimateDurationMs( text ) {
-        const byteLen = new TextEncoder().encode( text ).length + 2;
+        const byteLen = new TextEncoder().encode( text ).length + 4;
         return START_MS + GAP_MS + byteLen * 2 * ( SYMBOL_MS + GAP_MS ) + END_MS + 200;
+    }
+
+    function ackDurationMs() {
+        return START_MS + GAP_MS + 4 * 2 * ( SYMBOL_MS + GAP_MS ) + END_MS + 200;
     }
 
     /* ------------------------------------------------------------------ */
@@ -362,7 +396,7 @@ const Codec = ( function () {
                 this.nibbles.push( stable - TONE_DATA0 );
                 this.acceptedId = stable;
                 this.gapSeen = false;
-                if ( this.nibbles.length > ( MAX_PAYLOAD + 2 ) * 2 ) {
+                if ( this.nibbles.length > ( MAX_PAYLOAD + 4 ) * 2 ) {
                     this._finish( { ok: false, reason: 'Frame overflow' } );
                 }
             }
@@ -370,7 +404,7 @@ const Codec = ( function () {
     };
 
     Receiver.prototype._finalizeNibbles = function () {
-        if ( this.nibbles.length < 6 || this.nibbles.length % 2 !== 0 ) {
+        if ( this.nibbles.length < 8 || this.nibbles.length % 2 !== 0 ) {
             this._finish( { ok: false, reason: 'Incomplete frame (' + this.nibbles.length + ' symbols)' } );
             return;
         }
@@ -397,9 +431,11 @@ const Codec = ( function () {
         freqFor: freqFor,
         bandRange: bandRange,
         buildFrame: buildFrame,
+        buildAckFrame: buildAckFrame,
         parseFrame: parseFrame,
         send: send,
         estimateDurationMs: estimateDurationMs,
+        ackDurationMs: ackDurationMs,
         Receiver: Receiver
     };
 
