@@ -57,12 +57,15 @@
 
     const receiver = new Codec.Receiver( {
         onFrame: onFrameReceived,
+        onPartial: onPartialReceived,
         onStateChange: function ( state ) {
             if ( listening ) {
                 setStatus( state );
             }
         }
     } );
+
+    let incoming = null;    /* { el, textEl } — live preview bubble while a frame arrives */
 
     /* ------------------------------------------------------------------ */
     /* Persistence                                                        */
@@ -138,6 +141,9 @@
         messages.forEach( function ( msg ) {
             el.chatLog.appendChild( bubbleFor( msg ) );
         } );
+        if ( incoming ) {
+            el.chatLog.appendChild( incoming.el );
+        }
         el.chatLog.scrollTop = el.chatLog.scrollHeight;
     }
 
@@ -410,6 +416,63 @@
         }
     }
 
+    /* ---- live receive preview: reveal complete words as bytes land ---- */
+
+    function safeDecodeText( bytes ) {
+        let text = new TextDecoder( 'utf-8' ).decode( bytes );
+        /* Trailing replacement chars are just an unfinished multi-byte
+           sequence — hide them until the rest arrives. */
+        while ( text.length > 0 && text.charCodeAt( text.length - 1 ) === 0xfffd ) {
+            text = text.slice( 0, -1 );
+        }
+        return text;
+    }
+
+    function onPartialReceived( info ) {
+        if ( !incoming ) {
+            const bubble = document.createElement( 'div' );
+            bubble.className = 'bubble in receiving';
+            const textEl = document.createElement( 'span' );
+            textEl.className = 'partial-text';
+            const dots = document.createElement( 'span' );
+            dots.className = 'ellipsis';
+            for ( let i = 0; i < 3; i++ ) {
+                dots.appendChild( document.createElement( 'span' ) );
+            }
+            bubble.appendChild( textEl );
+            bubble.appendChild( dots );
+            const emptyState = el.chatLog.querySelector( '.chat-empty' );
+            if ( emptyState ) {
+                emptyState.remove();
+            }
+            el.chatLog.appendChild( bubble );
+            incoming = { el: bubble, textEl: textEl };
+        }
+        let text = '';
+        if ( info.encrypted ) {
+            const code = activeEncCode();
+            if ( !code ) {
+                incoming.textEl.textContent = '🔒 ';
+                el.chatLog.scrollTop = el.chatLog.scrollHeight;
+                return;
+            }
+            text = safeDecodeText( Cipher.decrypt( info.payload, code ) );
+        } else {
+            text = safeDecodeText( info.payload );
+        }
+        /* One word at a time: only text up to the last completed word. */
+        const lastSpace = text.lastIndexOf( ' ' );
+        incoming.textEl.textContent = lastSpace >= 0 ? text.slice( 0, lastSpace + 1 ) : '';
+        el.chatLog.scrollTop = el.chatLog.scrollHeight;
+    }
+
+    function clearIncoming() {
+        if ( incoming ) {
+            incoming.el.remove();
+            incoming = null;
+        }
+    }
+
     function onFrameReceived( result ) {
         if ( result.kind === 'ack' ) {
             if ( result.ok ) {
@@ -417,6 +480,7 @@
             }
             return;    /* acks never appear in the chat log */
         }
+        clearIncoming();
         if ( result.ok ) {
             addMessage( {
                 id: Date.now().toString( 36 ) + Math.random().toString( 36 ).slice( 2, 7 ),

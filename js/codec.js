@@ -277,7 +277,7 @@ const Codec = ( function () {
     }
 
     function Receiver( callbacks ) {
-        this.callbacks = callbacks;    /* { onFrame, onStateChange } */
+        this.callbacks = callbacks;    /* { onFrame, onStateChange, onPartial } */
         this.ctx = null;
         this.stream = null;
         this.analyser = null;
@@ -297,6 +297,37 @@ const Codec = ( function () {
         this.acceptedId = null;
         this.gapSeen = false;
         this.lastToneAt = 0;
+        this.lastPartialLen = -1;
+    };
+
+    /*
+     * Streams the payload decoded so far to onPartial while a data frame
+     * is still arriving, so the UI can preview the incoming message.
+     * Fires only when another full payload byte has landed.
+     */
+    Receiver.prototype._emitPartial = function () {
+        if ( !this.callbacks.onPartial || this.nibbles.length < 4 ) {
+            return;
+        }
+        const byteCount = Math.floor( this.nibbles.length / 2 );
+        const bytes = new Uint8Array( byteCount );
+        for ( let i = 0; i < byteCount; i++ ) {
+            bytes[ i ] = ( this.nibbles[ i * 2 ] << 4 ) | this.nibbles[ i * 2 + 1 ];
+        }
+        if ( bytes[ 0 ] !== TYPE_DATA ) {
+            return;
+        }
+        const length = bytes[ 1 ] & 0x7f;
+        const payload = bytes.slice( 3, Math.min( 3 + length, byteCount ) );
+        if ( payload.length === this.lastPartialLen ) {
+            return;
+        }
+        this.lastPartialLen = payload.length;
+        this.callbacks.onPartial( {
+            encrypted: ( bytes[ 1 ] & 0x80 ) !== 0,
+            length: length,
+            payload: payload
+        } );
     };
 
     Receiver.prototype.start = async function ( ctx ) {
@@ -398,7 +429,9 @@ const Codec = ( function () {
                 this.gapSeen = false;
                 if ( this.nibbles.length > ( MAX_PAYLOAD + 4 ) * 2 ) {
                     this._finish( { ok: false, reason: 'Frame overflow' } );
+                    return;
                 }
+                this._emitPartial();
             }
         }
     };
